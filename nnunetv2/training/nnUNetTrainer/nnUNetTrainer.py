@@ -187,11 +187,6 @@ class nnUNetTrainer(object):
         self.save_every = 50
         self.disable_checkpointing = False
 
-        ### activation saving stuff
-        self.save_activations = False  # Set to True to enable activation saving
-        self.activation_save_frequency = 10  # Save activations every N epochs
-        self.activations_folder = None  # Will be set in on_train_start
-
         self.was_initialized = False
 
         self.print_to_log_file("\n#######################################################################\n"
@@ -905,13 +900,6 @@ class nnUNetTrainer(object):
         self.dataloader_train, self.dataloader_val = self.get_dataloaders()
 
         maybe_mkdir_p(self.output_folder)
-        
-        # Initialize activations folder if activation saving is enabled
-        if self.save_activations:
-            self.activations_folder = join(self.output_folder, 'activations')
-            maybe_mkdir_p(self.activations_folder)
-            self.print_to_log_file(f"Activation saving enabled. Activations will be saved to: {self.activations_folder}")
-            self.print_to_log_file(f"Activations will be saved every {self.activation_save_frequency} epochs")
 
         # make sure deep supervision is on in the network
         self.set_deep_supervision_enabled(self.enable_deep_supervision)
@@ -998,15 +986,7 @@ class nnUNetTrainer(object):
         # If the device_type is 'mps' then it will complain that mps is not implemented, even if enabled=False is set. Whyyyyyyy. (this is why we don't make use of enabled=False)
         # So autocast will only be active if we have a cuda device.
         with autocast(self.device.type, enabled=True) if self.device.type == 'cuda' else dummy_context():
-            network_output = self.network(data)
-            
-            # Check if network returns tuple (output, activations) or just output
-            if isinstance(network_output, tuple):
-                output, activations = network_output
-            else:
-                output = network_output
-                activations = None
-            
+            output = self.network(data)
             # del data
             l = self.loss(output, target)
 
@@ -1020,11 +1000,7 @@ class nnUNetTrainer(object):
             l.backward()
             torch.nn.utils.clip_grad_norm_(self.network.parameters(), 12)
             self.optimizer.step()
-        
-        result = {'loss': l.detach().cpu().numpy()}
-        if activations is not None:
-            result['activations'] = activations
-        return result
+        return {'loss': l.detach().cpu().numpy()}
 
     def on_train_epoch_end(self, train_outputs: List[dict]):
         outputs = collate_outputs(train_outputs)
@@ -1037,11 +1013,6 @@ class nnUNetTrainer(object):
             loss_here = np.mean(outputs['loss'])
 
         self.logger.log('train_losses', loss_here, self.current_epoch)
-        
-        # Save activations if enabled
-        if self.save_activations and 'activations' in outputs and self.current_epoch % self.activation_save_frequency == 0:
-            if self.local_rank == 0:  # Only save on main process
-                self._save_activations(outputs['activations'], self.current_epoch)
 
     def on_validation_epoch_start(self):
         self.network.eval()
@@ -1237,74 +1208,6 @@ class nnUNetTrainer(object):
         if self.grad_scaler is not None:
             if checkpoint['grad_scaler_state'] is not None:
                 self.grad_scaler.load_state_dict(checkpoint['grad_scaler_state'])
-
-    def _save_activations(self, activations, epoch):
-        """
-        Save activations to disk. This method handles different activation formats.
-        
-        Args:
-            activations: Can be a dict, list, or tensor of activations
-            epoch: Current epoch number
-        """
-        if self.activations_folder is None:
-            return
-            
-        import pickle
-        
-        # Create epoch-specific folder
-        epoch_folder = join(self.activations_folder, f'epoch_{epoch}')
-        maybe_mkdir_p(epoch_folder)
-        
-        # Process activations based on their type
-        if isinstance(activations, dict):
-            # If activations is a dict with layer names as keys
-            for layer_name, activation in activations.items():
-                if isinstance(activation, torch.Tensor):
-                    # Move to CPU and convert to numpy
-                    activation_np = activation.detach().cpu().numpy()
-                elif isinstance(activation, list):
-                    # List of tensors
-                    activation_np = [a.detach().cpu().numpy() if isinstance(a, torch.Tensor) else a for a in activation]
-                else:
-                    activation_np = activation
-                    
-                # Save as numpy file
-                save_path = join(epoch_folder, f'{layer_name}.npy')
-                np.save(save_path, activation_np)
-                
-        elif isinstance(activations, list):
-            # If activations is a list (e.g., from multiple batches)
-            # We'll save each batch separately or concatenate them
-            for idx, activation_batch in enumerate(activations):
-                if isinstance(activation_batch, dict):
-                    # Each batch is a dict
-                    for layer_name, activation in activation_batch.items():
-                        if isinstance(activation, torch.Tensor):
-                            activation_np = activation.detach().cpu().numpy()
-                        else:
-                            activation_np = activation
-                        save_path = join(epoch_folder, f'batch_{idx}_{layer_name}.npy')
-                        np.save(save_path, activation_np)
-                elif isinstance(activation_batch, torch.Tensor):
-                    activation_np = activation_batch.detach().cpu().numpy()
-                    save_path = join(epoch_folder, f'batch_{idx}.npy')
-                    np.save(save_path, activation_np)
-                    
-        elif isinstance(activations, torch.Tensor):
-            # Single tensor
-            activation_np = activations.detach().cpu().numpy()
-            save_path = join(epoch_folder, 'activations.npy')
-            np.save(save_path, activation_np)
-        
-        # Also save metadata
-        metadata = {
-            'epoch': epoch,
-            'timestamp': datetime.now().isoformat(),
-            'activation_type': type(activations).__name__,
-        }
-        save_json(metadata, join(epoch_folder, 'metadata.json'))
-        
-        self.print_to_log_file(f"Saved activations for epoch {epoch} to {epoch_folder}")
 
     def perform_actual_validation(self, save_probabilities: bool = False):
         self.set_deep_supervision_enabled(False)
